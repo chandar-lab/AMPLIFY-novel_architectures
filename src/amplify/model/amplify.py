@@ -3,10 +3,10 @@
 # From https://github.com/facebookresearch/llama/blob/main/llama/model.py
 import yaml
 
-import hydra
 import safetensors
 import torch
 from torch import nn
+from torch.nn.functional import scaled_dot_product_attention
 from xformers.ops import SwiGLU, memory_efficient_attention
 
 from .rmsnorm import RMSNorm
@@ -100,27 +100,34 @@ class EncoderBlock(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout_prob)
 
         # Feedforward network
-        match config.hidden_act.lower():
-            case "swiglu":
-                # To keep the number of parameters and the amount of computation constant, we reduce the number of
-                # hidden units by a factor of 2/3 (https://arxiv.org/pdf/2002.05202.pdf) and make it a multiple of 8 to
-                # avoid RuntimeError due to misaligned operand
-                multiple_of = 8
-                intermediate_size = int(2 * config.intermediate_size / 3)
-                intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
-                self.ffn = SwiGLU(config.hidden_size, intermediate_size, config.hidden_size, bias=config.ffn_bias)
-            case "relu":
-                self.ffn = nn.Sequential(
-                    nn.Linear(config.hidden_size, config.intermediate_size, bias=config.ffn_bias),
-                    nn.ReLU(),
-                    nn.Linear(config.intermediate_size, config.hidden_size, bias=config.ffn_bias),
-                )
-            case "gelu":
-                self.ffn = nn.Sequential(
-                    nn.Linear(config.hidden_size, config.intermediate_size, bias=config.ffn_bias),
-                    nn.GELU(),
-                    nn.Linear(config.intermediate_size, config.hidden_size, bias=config.ffn_bias),
-                )
+        act = config.hidden_act.lower()
+        if act == "swiglu":
+            # To keep the number of parameters and the amount of computation constant, we reduce the number of
+            # hidden units by a factor of 2/3 (https://arxiv.org/pdf/2002.05202.pdf) and make it a multiple of 8 to
+            # avoid RuntimeError due to misaligned operand
+            multiple_of = 8
+            intermediate_size = int(2 * config.intermediate_size / 3)
+            intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
+            self.ffn = SwiGLU(
+                config.hidden_size,
+                intermediate_size,
+                config.hidden_size,
+                bias=config.ffn_bias
+            )
+        elif act == "relu":
+            self.ffn = nn.Sequential(
+                nn.Linear(config.hidden_size, config.intermediate_size, bias=config.ffn_bias),
+                nn.ReLU(),
+                nn.Linear(config.intermediate_size, config.hidden_size, bias=config.ffn_bias),
+            )
+        elif act == "gelu":
+            self.ffn = nn.Sequential(
+                nn.Linear(config.hidden_size, config.intermediate_size, bias=config.ffn_bias),
+                nn.GELU(),
+                nn.Linear(config.intermediate_size, config.hidden_size, bias=config.ffn_bias),
+            )
+        else:
+            raise ValueError(f"Unsupported hidden_act: {config.hidden_act}")
 
         self.attention_norm = RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
@@ -143,22 +150,38 @@ class EncoderBlock(nn.Module):
         xv = xv.view(batch_size, seq_len, self.config.num_attention_heads, self.d_head)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
-        attn = memory_efficient_attention(
-            query=xq,
-            key=xk,
-            value=xv,
-            attn_bias=pad_mask,
-            p=self.config.dropout_prob if self.training else 0,
-        )
-
-        _attn = None
+        # Compute the attention weight
+        attn_weights = None
         if output_attentions:
-            _attn = xq.permute(0, 2, 1, 3) @ xk.permute(0, 2, 3, 1) / (xq.size(-1) ** 0.5)
+            attn_weights = xq.permute(0, 2, 1, 3) @ xk.permute(0, 2, 3, 1) / (xq.size(-1) ** 0.5)
             if pad_mask is not None:
-                _attn = _attn + pad_mask
-            _attn = _attn.softmax(-1)
-        return self.resid_dropout(self.wo(attn.view(batch_size, seq_len, self.config.num_attention_heads * self.d_head))), _attn
+                attn_weights = attn_weights + pad_mask
+            attn_weights = attn_weights.softmax(-1)
 
+        # Compute the attention using xformers if the tensors are on GPU
+        if x.is_cuda:
+            # Input and output are of dimension (B, M, H, K) where B is the batch size, M the sequence length,
+            # H the number of heads, and K the embeding size per head
+            attn = memory_efficient_attention(
+                query=xq,
+                key=xk,
+                value=xv,
+                attn_bias=pad_mask,
+                p=self.config.dropout_prob if self.training else 0,
+            )
+        else:
+            # Input and output are of dimension (B, H, M, K)
+            attn = scaled_dot_product_attention(
+                query=xq.transpose(1, 2),
+                key=xk.transpose(1, 2),
+                value=xv.transpose(1, 2),
+                attn_mask=pad_mask,
+                dropout_p=self.config.dropout_prob if self.training else 0,
+            ).transpose(1, 2)
+
+        attn_scores = self.wo(attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.d_head))
+        return (self.resid_dropout(attn_scores), attn_weights)
+    
     def _ff_block(self, x: torch.Tensor):
         return self.ffn_dropout(self.ffn(x))
 
@@ -231,10 +254,9 @@ class AMPLIFY(AMPLIFYPreTrainedModel):
         hidden_states, attentions = [], []
 
         # Expand and repeat: (Batch, Length) -> (Batch, Heads, Length, Length)
-        if pad_mask is not None and not torch.all(pad_mask == 0):
+        if pad_mask is not None:
+            assert pad_mask.dtype != torch.bool and 1.0 not in pad_mask, "AMPLIFY expects an additive pad_mask"
             pad_mask = pad_mask.unsqueeze(1).unsqueeze(1).repeat(1, self.config.num_attention_heads, pad_mask.size(-1), 1)
-        else:
-            pad_mask = None
 
         # RoPE
         self.freqs_cis = self.freqs_cis.to(src.device, non_blocking=True)

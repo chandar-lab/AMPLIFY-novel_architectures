@@ -4,6 +4,16 @@ Public protein sequence databases contain samples from the fitness landscape exp
 
 Link to the pre-print: [https://www.biorxiv.org/content/10.1101/2024.09.23.614603v1](https://www.biorxiv.org/content/10.1101/2024.09.23.614603v1)
 
+## News
+
+**AMPLIFY is now available on Hugging Face 🤗!**
+
+- [`AMPLIFY_350M`](https://huggingface.co/chandar-lab/AMPLIFY_350M)
+- [`AMPLIFY_350M_base`](https://huggingface.co/chandar-lab/AMPLIFY_350M_base)
+- [`AMPLIFY_120M`](https://huggingface.co/chandar-lab/AMPLIFY_120M)
+- [`AMPLIFY_120M_base`](https://huggingface.co/chandar-lab/AMPLIFY_120M_base)
+- [`UR100P`](https://huggingface.co/datasets/chandar-lab/UR100P)
+
 ## Installation as a Local Pip Package
 
 The repository functions can be built into a Python virtual environment as:
@@ -125,15 +135,20 @@ The following command launches the first stage of pre-training AMPLIFY 350M (def
 
 ```bash
 accelerate launch \
-
-	--config_file=conf/accelerate_deepspeed_zero3.yaml \
+	--config_file=conf/accelerate_ddp.yaml \
 	--num_processes=2 \
 	--mixed_precision=bf16 \
 	--gradient_clipping=1.0 \
-	main.py \
+	scripts/pretrain.py \
 	hydra.run.dir=logs/AMPLIFY_350M \
 	wandb.dir=logs/AMPLIFY_350M \
 	wandb.name=AMPLIFY_350M \
+	dataset.train.paths.uniref100=<path/to/uniref100_train.csv> \
+	dataset.train.paths.pdb=<path/to/scop_train.csv> \
+	dataset.train.paths.oas=<path/to/oas_train.csv> \
+	dataset.validation.paths.uniprot=<path/to/uniprot_dev.csv> \
+	dataset.validation.paths.pdb=<path/to/scop_dev.csv> \
+	dataset.validation.paths.oas=<path/to/oas_dev.csv> \
 	trainer.dir=logs/AMPLIFY_350M \
 	trainer.train.per_device_batch_size=128 \
 	trainer.validation.per_device_batch_size=128 \
